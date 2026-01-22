@@ -37,6 +37,7 @@ func installScriptForApp(app inputApp, cask *brewCask) (string, error) {
 		switch {
 		case len(artifact.App) > 0:
 			sb.Write("# copy to the applications folder")
+			sb.Writef("echo 'Installing %s...'", app.Name)
 			// Quit the app before installing if it's running, and track state for relaunch
 			sb.Writef("quit_and_track_application '%s'", app.UniqueIdentifier)
 			for _, appItem := range artifact.App {
@@ -46,15 +47,20 @@ func installScriptForApp(app inputApp, cask *brewCask) (string, error) {
 				}
 				appPath := appItem.String
 				sb.Writef(`if [ -d "$APPDIR/%[1]s" ]; then
+	echo "Backing up existing %[1]s..."
 	sudo mv "$APPDIR/%[1]s" "$TMPDIR/%[1]s.bkp"
 fi`, appPath)
+				sb.Writef(`echo "Copying %s to /Applications/..."`, appPath)
 				sb.Copy(appPath, "$APPDIR")
+				sb.Writef(`echo "%s installed successfully"`, appPath)
 			}
 			// Relaunch the app if it was running before installation
 			sb.Writef("relaunch_application '%s'", app.UniqueIdentifier)
+			sb.Write(`echo "Installation completed"`)
 
 		case len(artifact.Pkg) > 0:
 			sb.Write("# install pkg files")
+			sb.Writef("echo 'Installing %s via PKG installer...'", app.Name)
 			// Quit the app before installing if it's running, and track state for relaunch
 			sb.Writef("quit_and_track_application '%s'", app.UniqueIdentifier)
 			switch len(artifact.Pkg) {
@@ -69,8 +75,10 @@ fi`, appPath)
 			default:
 				return "", fmt.Errorf("application %s has unknown directive format for pkg", app.Token)
 			}
+			sb.Write(`echo "PKG installation completed"`)
 			// Relaunch the app if it was running before installation
 			sb.Writef("relaunch_application '%s'", app.UniqueIdentifier)
+			sb.Write(`echo "Installation completed"`)
 
 		case len(artifact.Binary) > 0:
 			if len(artifact.Binary) == 2 {
@@ -329,12 +337,14 @@ type scriptBuilder struct {
 }
 
 func newScriptBuilder() *scriptBuilder {
-	return &scriptBuilder{
+	sb := &scriptBuilder{
 		statements:   []string{},
 		variables:    map[string]string{},
 		functions:    map[string]string{},
 		pathsCreated: map[string]struct{}{},
 	}
+	sb.AddFunction("echo", echoFunc)
+	return sb
 }
 
 // AddVariable adds a variable definition to the script
@@ -367,14 +377,23 @@ func (s *scriptBuilder) Extract(format string) {
 	switch format {
 	case "dmg":
 		s.Write("# extract contents")
-		s.Write(`MOUNT_POINT=$(mktemp -d /tmp/dmg_mount_XXXXXX)
-hdiutil attach -plist -nobrowse -readonly -mountpoint "$MOUNT_POINT" "$INSTALLER_PATH"
-sudo cp -R "$MOUNT_POINT"/* "$TMPDIR"
-hdiutil detach "$MOUNT_POINT"`)
+		s.Write(`echo "Creating temporary mount point..."`)
+		s.Write(`MOUNT_POINT=$(mktemp -d /tmp/dmg_mount_XXXXXX)`)
+		s.Write(`echo "Mounting DMG installer at $MOUNT_POINT..."`)
+		s.Write(`hdiutil attach -plist -nobrowse -readonly -mountpoint "$MOUNT_POINT" "$INSTALLER_PATH"`)
+		s.Write(`echo "DMG mounted successfully"`)
+		s.Write(`echo "Extracting contents to temporary directory..."`)
+		s.Write(`sudo cp -R "$MOUNT_POINT"/* "$TMPDIR"`)
+		s.Write(`echo "Contents extracted successfully"`)
+		s.Write(`echo "Unmounting DMG..."`)
+		s.Write(`hdiutil detach "$MOUNT_POINT"`)
+		s.Write(`echo "DMG unmounted"`)
 
 	case "zip":
 		s.Write("# extract contents")
+		s.Write(`echo "Extracting ZIP archive..."`)
 		s.Write(`unzip "$INSTALLER_PATH" -d "$TMPDIR"`)
+		s.Write(`echo "ZIP extraction complete"`)
 	}
 }
 
@@ -399,7 +418,9 @@ func (s *scriptBuilder) RemoveFile(file string) {
 // Returns an error if generating the XML for choices fails.
 func (s *scriptBuilder) InstallPkg(pkg string, choices ...[]brewPkgConfig) error {
 	if len(choices) == 0 {
+		s.Writef(`echo "Running installer for %s..."`, pkg)
 		s.Writef(`sudo installer -pkg "$TMPDIR/%s" -target /`, pkg)
+		s.Writef(`echo "Installation completed for %s"`, pkg)
 		return nil
 	}
 
@@ -772,4 +793,13 @@ const forgetPkgFunc = `forget_pkg() {
 forget_receipt() {
   local PKGID="$1"
   sudo pkgutil --forget "$PKGID"
+}`
+
+
+// echoFunc overrides the built-in echo to also log to macOS unified logging system.
+// All echo statements in generated scripts will log with "fleetdm.installer:" prefix
+// making them searchable via: log show --predicate 'eventMessage CONTAINS "fleetdm.installer"'
+const echoFunc = `echo() {
+  logger -p user.info "fleetdm.installer: $*"
+  builtin echo "$@"
 }`
